@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import argparse
+import boto3
 from datetime import datetime
 import glob
 import random
@@ -18,21 +20,21 @@ from pathlib import Path
 import sys
 
 from time import time
-from pdb import set_trace
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 # Hyperparameter Config
 BATCH_SIZE = 64
 LR = 1e-4
 EPOCHS = 150
-WARMUP_EPOCHS = 15
+WARMUP_EPOCHS = 20
 PATCH_SIZE = 128
 VIT_PATCH_SIZE = 4
 MASK_RATIO = 0.7
-SAMPLES_PER_FILE = 500
+SAMPLES_PER_FILE = 750
 DROPOUT = 0.1
-GRADIENT_LOSS_WEIGHT = 0.15 #.15
+GRADIENT_LOSS_WEIGHT = 0.35 #.15
 RELU_PENALTY_WEIGHT = 0.1
 EARLY_STOP_PATIENCE = 25
 # Tries to grab GPU if you have it. Had some trouble with this at first. Needed to download a a specific verison of torch to match
@@ -40,8 +42,8 @@ EARLY_STOP_PATIENCE = 25
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ViT Config
-# Residual (1) + DOY (1) + SNODAS (4) + Static (12) + Cloud Mask (1) + Valid Mask (1) = 20 Channels
-IN_CHANS = 20
+# Residual (1) + SNODAS (4) + Static (10) + Cloud Mask (1) + Valid Mask (1) = 17 Channels
+IN_CHANS = 17
 OUT_CHANS = 1
 EMBED_DIM = 256
 DECODER_EMBED_DIM = 256
@@ -50,17 +52,18 @@ NUM_LAYERS = 6
 NUM_DECODER_LAYERS = 6
 
 #########################################################################################################################################
-###### CHANGE THESE TO WHATEVER LOCAL DIR YOU DOWNLOAD FILES TO ######
-BASE_PATH = Path("/home/rtheurer/repos/classproject/geospatial_data")
-DATA_DIR        = BASE_PATH / "dynamic_days"
-STATIC_DIR      = BASE_PATH / "static_topo"
-BASE_OUTPUT_DIR = BASE_PATH / "training_outputs"
-# DON"T CHANGE THIS EMPTY ONE!
-OUTPUT_DIR = ''
-
-# ENCODER SELECTION: CAN CHOOSE APE, alibi_2d, alibi_3d
+###### ENCODER SELECTION: CAN CHOOSE APE, alibi_2d, alibi_3d ######
 # POSITIONAL_EMBEDDING_LIST = ['APE', 'alibi_2d', 'alibi_3d'] change to this to run all embeddings
 POSITIONAL_EMBEDDING_LIST = ['APE']
+
+# Paths and S3 config — set from CLI args at runtime in __main__
+DATA_DIR   = None
+STATIC_DIR = None
+S3_CLIENT           = None
+S3_BUCKET           = ''
+S3_CHECKPOINT_PREFIX = ''
+OUTPUT_S3_PREFIX    = ''   # s3 prefix for this run's outputs (includes datetime folder)
+TEMP_DIR            = Path('/tmp/geog_ml_temp')
 #########################################################################################################################################
 
 # Date time string to make output folder and save output with
@@ -82,7 +85,7 @@ FN_B         = 'CA_acqMB_20240922_specrgb_r956_full_extent_b_fixed_2.tif'
 FN_CANOPY    = 'CA_acqMB_20240922_canopyhgt_r1330_full_extent_fixed_2.tif'
 
 STATIC_FILENAMES = [
-    FN_DTM, FN_CURV_GEN, FN_CURV_PLAN, FN_TPI_9, FN_TPI_101,
+    FN_DTM, FN_CURV_GEN, FN_TPI_101,
     FN_SLOPE, FN_EAST, FN_NORTH,
     FN_R, FN_G, FN_B, FN_CANOPY
 ]
@@ -106,10 +109,9 @@ def verify_data_integrity(folder_list):
         if i >= 5: break 
         #res_files = glob.glob(os.path.join(folder, "*residual*") )
         res_files = glob.glob(os.path.join(folder, "*ASO*") )
-        doy_files = glob.glob(os.path.join(folder, "*acqdoy*") )
         snodas_files = glob.glob(os.path.join(folder, "*SNODAS*") )
-        
-        if res_files and doy_files and len(snodas_files) == 4:
+
+        if res_files and len(snodas_files) == 4:
             valid_count += 1
     
     if valid_count == 0:
@@ -252,10 +254,10 @@ def compute_dataset_stats(folder_list):
     print("Computing dataset statistics (Mean/Std)...")
 
     static_filenames = [
-        FN_DTM, FN_CURV_GEN, FN_CURV_PLAN, FN_TPI_9, FN_TPI_101,
+        FN_DTM, FN_CURV_GEN, FN_TPI_101,
         FN_SLOPE, FN_EAST, FN_NORTH,
-        FN_R, FN_G, FN_B,FN_CANOPY
-    ] 
+        FN_R, FN_G, FN_B, FN_CANOPY
+    ]
 
     static_stack = []
     for fn in static_filenames:
@@ -275,23 +277,20 @@ def compute_dataset_stats(folder_list):
         try:
             #res_files = glob.glob(os.path.join(folder_path, "*residual*") )
             res_files = glob.glob(os.path.join(folder_path, "*ASO*") )
-            doy_files = glob.glob(os.path.join(folder_path, "*acqdoy*") )
             # Sort SNODAS data in chronological order
             snodas_files = sorted(glob.glob(os.path.join(folder_path, "*SNODAS*") ))
 
-            if not res_files or not doy_files or len(snodas_files) != 4: 
+            if not res_files or len(snodas_files) != 4:
                 print(f"Skipping {os.path.basename(folder_path)}: Missing files.")
                 continue
 
             # Set -9999 fill as NaN
             res = tiff.imread(res_files[0]).flatten().astype(np.float32)
-            doy = tiff.imread(doy_files[0]).flatten().astype(np.float32)
-            snodas = [tiff.imread(f).flatten().astype(np.float32) for f in snodas_files]            
+            snodas = [tiff.imread(f).flatten().astype(np.float32) for f in snodas_files]
             res[res == -9999] = np.nan
-            doy[doy == -9999] = np.nan
             for s in snodas: s[s == -9999] = np.nan
 
-            dynamic_stack = np.stack([res, doy] + snodas, axis=1)
+            dynamic_stack = np.stack([res] + snodas, axis=1)
 
             if len(res) != len(static_stack):
                 print(f"Skipping {os.path.basename(folder_path)}: Size mismatch.")
@@ -381,28 +380,24 @@ class GeoFolderDataset(Dataset):
         print(f"Caching {len(folder_list)} folders into RAM...", end=" ", flush=True)
         for folder_path in folder_list:
             res_files = glob.glob(os.path.join(folder_path, "*ASO*"))
-            doy_files = glob.glob(os.path.join(folder_path, "*acqdoy*"))
             snodas_files = sorted(glob.glob(os.path.join(folder_path, "*SNODAS*")))
 
-            if not res_files or not doy_files or len(snodas_files) != 4:
+            if not res_files or len(snodas_files) != 4:
                 continue
 
             res_img = tiff.imread(res_files[0]).astype(np.float32)
-            doy_img = tiff.imread(doy_files[0]).astype(np.float32)
             snodas_imgs = [tiff.imread(f).astype(np.float32) for f in snodas_files]
 
             valid_mask = ((res_img != -9999) & ~np.isnan(res_img)).astype(np.float32)
 
             res_img[res_img == -9999] = 0.0
             res_img[np.isnan(res_img)] = 0.0
-            doy_img[doy_img == -9999] = 0.0
-            doy_img[np.isnan(doy_img)] = 0.0
 
             for i in range(len(snodas_imgs)):
                 snodas_imgs[i][snodas_imgs[i] == -9999] = 0.0
                 snodas_imgs[i][np.isnan(snodas_imgs[i])] = 0.0
 
-            all_channels = [res_img, doy_img] + snodas_imgs + self.static_imgs
+            all_channels = [res_img] + snodas_imgs + self.static_imgs
             image_stack = np.stack(all_channels, axis=0).astype(np.float32)
 
             image_stack = (image_stack - self.mean) / self.std
@@ -435,9 +430,6 @@ class GeoFolderDataset(Dataset):
 
         # Augment training data, don't augment validation data
         # Can only add random noise can't flip or rotate because aspect matters
-        if self.augment:
-            noise = torch.randn_like(tensor_stack) * 0.02
-            tensor_stack = tensor_stack + noise
 
         valid_mask_patch = torch.from_numpy(
             valid_mask[top:top+self.patch_size, left:left+self.patch_size].copy()
@@ -447,26 +439,21 @@ class GeoFolderDataset(Dataset):
 
 def generate_multiscale_mask(batch_size, size=128, target_ratio=0.75):
     masks = torch.ones(batch_size, 1, size, size, device=DEVICE)
-    total_pixels = size * size
-
-    for i in range(batch_size):
-        masked_pixels = 0
-        while masked_pixels / total_pixels < target_ratio:
-            mode = random.randint(0, 3)
-            if mode == 0: min_s, max_s = 0.02, 0.05
-            elif mode == 1: min_s, max_s = 0.05, 0.20
-            elif mode == 2: min_s, max_s = 0.20, 0.50
-            else: min_s, max_s = 0.02, 0.40
-
-            cloud_w = random.randint(max(1, int(size * min_s)), int(size * max_s))
-            cloud_h = random.randint(max(1, int(size * min_s)), int(size * max_s))
-
-            x = random.randint(0, size - cloud_w)
-            y = random.randint(0, size - cloud_h)
-
-            masks[i, 0, y:y+cloud_h, x:x+cloud_w] = 0.0
-            masked_pixels = total_pixels - masks[i, 0].sum().item()
-
+    num_rects = 20
+    scale_min = torch.tensor([0.02, 0.05, 0.20, 0.02], device=DEVICE)
+    scale_max = torch.tensor([0.05, 0.20, 0.50, 0.40], device=DEVICE)
+    modes = torch.randint(0, 4, (batch_size, num_rects), device=DEVICE)
+    min_s = scale_min[modes]
+    max_s = scale_max[modes]
+    rw = (min_s + torch.rand((batch_size, num_rects), device=DEVICE) * (max_s - min_s)) * size
+    rh = (min_s + torch.rand((batch_size, num_rects), device=DEVICE) * (max_s - min_s)) * size
+    rw = rw.clamp(1, size).long()
+    rh = rh.clamp(1, size).long()
+    rx = (torch.rand((batch_size, num_rects), device=DEVICE) * (size - rw)).long()
+    ry = (torch.rand((batch_size, num_rects), device=DEVICE) * (size - rh)).long()
+    for r in range(num_rects):
+        for b in range(batch_size):
+            masks[b, 0, ry[b,r]:ry[b,r]+rh[b,r], rx[b,r]:rx[b,r]+rw[b,r]] = 0.0
     return masks
 
 
@@ -590,7 +577,7 @@ class MaskedAutoencoderViT(nn.Module):
     
     def get_attn_bias_2d(self, x):
         # Get elev data fir alibi bias
-        elev_map = x[:, 6:7, :, :]
+        elev_map = x[:, 5:6, :, :]
 
         elev_patches = torch.nn.functional.adaptive_avg_pool2d(elev_map, (self.grid_size, self.grid_size))
         elev_patches = elev_patches.flatten(2).squeeze(1)
@@ -604,7 +591,7 @@ class MaskedAutoencoderViT(nn.Module):
 
     def get_attn_bias_3d(self, x):
         # Get elev data fir alibi bias
-        elev_map = x[:, 6:7, :, :] 
+        elev_map = x[:, 5:6, :, :]
       
         elev_patches = torch.nn.functional.adaptive_avg_pool2d(elev_map, (self.grid_size, self.grid_size))
         elev_patches = elev_patches.flatten(2).squeeze(1) 
@@ -618,10 +605,10 @@ class MaskedAutoencoderViT(nn.Module):
     
     def get_attn_bias_6d(self, x):
         # Attention bias retrieval code that didn't work, please ignore
-        elev_map = x[:, 6:7, :, :]
-        slope_map = x[:, 11:12, :, :]
-        aspect_e_map = x[:, 12:13, :, :]
-        aspect_n_map = x[:, 13:14, :, :]
+        elev_map = x[:, 5:6, :, :]
+        slope_map = x[:, 8:9, :, :]
+        aspect_e_map = x[:, 9:10, :, :]
+        aspect_n_map = x[:, 10:11, :, :]
       
         pool = torch.nn.functional.adaptive_avg_pool2d
         elev_patches = pool(elev_map, (self.grid_size, self.grid_size)).flatten(2).squeeze(1)
@@ -723,9 +710,11 @@ def save_loss_plot(train_losses, val_losses, positional_embedding):
     plt.legend()
     plt.grid(True)
 
-    path = os.path.join(OUTPUT_DIR, f'loss_curve_{positional_embedding}_{DATE_TIME}.png') 
-    plt.savefig(path)
+    filename = f'loss_curve_{positional_embedding}_{DATE_TIME}.png'
+    local_path = TEMP_DIR / filename
+    plt.savefig(str(local_path))
     plt.close()
+    upload_and_delete(local_path, filename)
 
 def visualize_test_samples(loader, model, epoch, positional_embedding):
     model.eval()
@@ -781,9 +770,11 @@ def visualize_test_samples(loader, model, epoch, positional_embedding):
         axes[i][2].set_title("Ground Truth (Snowdepth)")
 
     plt.tight_layout()
-    path = os.path.join(OUTPUT_DIR, f'prediction_samples_epoch_{epoch}_{positional_embedding}_{DATE_TIME}.png')
-    plt.savefig(path)
+    filename = f'prediction_samples_epoch_{epoch}_{positional_embedding}_{DATE_TIME}.png'
+    local_path = TEMP_DIR / filename
+    plt.savefig(str(local_path))
     plt.close()
+    upload_and_delete(local_path, filename)
 
 def calculate_metrics_in_meters(loader, model, stats):
     model.eval()
@@ -830,8 +821,8 @@ def calculate_metrics_in_meters(loader, model, stats):
     return rmse, mae
 
 CHANNEL_NAMES = [
-    'Snow Depth (ASO)', 'Day of Year', 'SNODAS_1', 'SNODAS_2', 'SNODAS_3', 'SNODAS_4',
-    'DTM', 'Curvature (General)', 'Curvature (Plan)', 'TPI_9', 'TPI_101',
+    'Snow Depth (ASO)', 'SNODAS_1', 'SNODAS_2', 'SNODAS_3', 'SNODAS_4',
+    'DTM', 'Curvature (General)', 'TPI_101',
     'Slope', 'Eastness', 'Northness', 'R', 'G', 'B', 'Canopy Height'
 ]
 
@@ -846,7 +837,7 @@ def channel_ablation_study(loader, model, stats):
     print(f"\n  Baseline RMSE: {baseline_rmse:.4f} m | MAE: {baseline_mae:.4f} m\n")
 
     results = []
-    for ch in range(18):
+    for ch in range(15):
         model.eval()
         mse_accum = 0.0
         mae_accum = 0.0
@@ -905,15 +896,17 @@ def channel_ablation_study(loader, model, stats):
         marker = " ***" if delta > 0.01 else ""
         print(f"  {rank:<5} {name:<22} {delta:>+12.4f} m{marker}")
 
-    # Save results to file
-    ablation_path = os.path.join(OUTPUT_DIR, f'channel_ablation_{positional_embedding}_{DATE_TIME}.txt')
-    with open(ablation_path, 'w') as f:
+    # Save results to file and upload to S3
+    ablation_filename = f'channel_ablation_{positional_embedding}_{DATE_TIME}.txt'
+    ablation_local = TEMP_DIR / ablation_filename
+    with open(str(ablation_local), 'w') as f:
         f.write(f"Baseline RMSE: {baseline_rmse:.4f} m | MAE: {baseline_mae:.4f} m\n\n")
         f.write(f"{'Rank':<5} {'Ch':>3} {'Channel':<22} {'RMSE':>10} {'Delta RMSE':>12}\n")
         f.write(f"{'-'*55}\n")
         for rank, (ch, name, rmse, delta) in enumerate(results, 1):
             f.write(f"{rank:<5} {ch:>3} {name:<22} {rmse:>10.4f} {delta:>+12.4f}\n")
-    print(f"\n  Results saved to {ablation_path}")
+    upload_and_delete(ablation_local, ablation_filename)
+    print(f"\n  Results uploaded to s3://{S3_BUCKET}/{OUTPUT_S3_PREFIX}{ablation_filename}")
     print("=" * 70)
 
     return results
@@ -1007,8 +1000,12 @@ def make_output_plots(pos_emb_name, date_time_str, ground_truth_date, residual_g
     axes[2].set_ylabel("Frequency (Log Scale)")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"prediction_analysis_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png"))
-    print(f"Saved analysis plot to {os.path.join(OUTPUT_DIR, f'prediction_analysis_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png')}")
+    analysis_fn = f"prediction_analysis_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png"
+    analysis_local = TEMP_DIR / analysis_fn
+    plt.savefig(str(analysis_local))
+    plt.close()
+    upload_and_delete(analysis_local, analysis_fn)
+    print(f"Uploaded analysis plot to s3://{S3_BUCKET}/{OUTPUT_S3_PREFIX}{analysis_fn}")
     #plt.show()
 
     # Spatial Error Map
@@ -1025,15 +1022,18 @@ def make_output_plots(pos_emb_name, date_time_str, ground_truth_date, residual_g
     fig_map, ax_map = plt.subplots(figsize=(10, 8))
     im = ax_map.imshow(spatial_error, cmap='bwr', vmin=-4.0, vmax=4.0)
     if input_mask is not None:
-        input_visible = (input_mask > 0.1) & ~np.isnan(input_mask)
+        input_visible = (input_mask > 0.5) & ~np.isnan(input_mask)
         overlay = np.zeros((*spatial_error.shape, 4), dtype=np.float32)
         overlay[input_visible] = [1.0, 0.85, 0.0, 0.75]
         ax_map.imshow(overlay)
     fig_map.colorbar(im, ax=ax_map, label="Error (m) [Red = Overpredict, Blue = Underpredict]")
     ax_map.set_title("Spatial Error Map" + (" [Gold = Snow Depth Input to Model]" if input_mask is not None else ""))
-    fig_map.savefig(os.path.join(OUTPUT_DIR, f"spatial_error_map_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png"))
+    spatial_fn = f"spatial_error_map_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png"
+    spatial_local = TEMP_DIR / spatial_fn
+    fig_map.savefig(str(spatial_local))
     plt.close(fig_map)
-    print(f"Saved spatial map to {os.path.join(OUTPUT_DIR, f'spatial_error_map_for_{ground_truth_date}_{pos_emb_name}_{date_time_str}.png')}")
+    upload_and_delete(spatial_local, spatial_fn)
+    print(f"Uploaded spatial map to s3://{S3_BUCKET}/{OUTPUT_S3_PREFIX}{spatial_fn}")
 
     return rmse, mae, int(np.sum(valid_mask))
 
@@ -1052,19 +1052,15 @@ def predict_basin(folder_path, ground_truth_date, model, global_stats, blind=Tru
     model.eval()
     try:
         res_files = glob.glob(os.path.join(folder_path, "*ASO*") )
-        doy_files = glob.glob(os.path.join(folder_path, "*acqdoy*") )
         snodas_files = sorted(glob.glob(os.path.join(folder_path, "*SNODAS*") ))
 
-        if not res_files or not doy_files or len(snodas_files) != 4: return
+        if not res_files or len(snodas_files) != 4: return
 
         res_img = tiff.imread(res_files[0]).astype(np.float32)
-        doy_img = tiff.imread(doy_files[0]).astype(np.float32)
         snodas_imgs = [tiff.imread(f).astype(np.float32) for f in snodas_files]
 
-        res_img[res_img == -9999] = 0.0 
+        res_img[res_img == -9999] = 0.0
         res_img[np.isnan(res_img)] = 0.0
-        doy_img[doy_img == -9999] = 0.0
-        doy_img[np.isnan(doy_img)] = 0.0
 
         for i in range(len(snodas_imgs)):
             snodas_imgs[i][snodas_imgs[i] == -9999] = 0.0
@@ -1073,7 +1069,7 @@ def predict_basin(folder_path, ground_truth_date, model, global_stats, blind=Tru
         # Get static topo input data
         static_imgs = []
         static_filenames = [
-            FN_DTM, FN_CURV_GEN, FN_CURV_PLAN, FN_TPI_9, FN_TPI_101,
+            FN_DTM, FN_CURV_GEN, FN_TPI_101,
             FN_SLOPE, FN_EAST, FN_NORTH,
             FN_R, FN_G, FN_B, FN_CANOPY
         ]
@@ -1087,7 +1083,7 @@ def predict_basin(folder_path, ground_truth_date, model, global_stats, blind=Tru
             static_imgs.append(s_img)
 
         # Stack data and normalize
-        all_channels = [res_img, doy_img] + snodas_imgs + static_imgs
+        all_channels = [res_img] + snodas_imgs + static_imgs
         full_stack = np.stack(all_channels, axis=0).astype(np.float32)
         channels, h, w = full_stack.shape
 
@@ -1167,7 +1163,8 @@ def predict_basin(folder_path, ground_truth_date, model, global_stats, blind=Tru
             return_mask = np.where(valid_mask_full == 1.0, avg_visible, np.nan)
 
         run_label = "blind" if blind else "partial"
-        output_path = os.path.join(OUTPUT_DIR, f"model_prediction_for_date_{ground_truth_date}_{positional_embedding}_{DATE_TIME}_{run_label}.tif")
+        pred_filename = f"model_prediction_for_date_{ground_truth_date}_{DATE_TIME}_{run_label}.tif"
+        output_path = str(TEMP_DIR / pred_filename)
         tiff.imwrite(output_path, real_prediction)
         print(f"Analysis-Ready Prediction saved to {output_path}")
         return [output_path, res_files[0], return_mask]
@@ -1175,19 +1172,60 @@ def predict_basin(folder_path, ground_truth_date, model, global_stats, blind=Tru
     except Exception as e:
         print(f"Error predicting basin: {e}")
 
+def save_checkpoint_to_s3(checkpoint_data):
+    local_path = TEMP_DIR / 'checkpoint.pt'
+    torch.save(checkpoint_data, str(local_path))
+    s3_key = S3_CHECKPOINT_PREFIX + 'checkpoint.pt'
+    S3_CLIENT.upload_file(str(local_path), S3_BUCKET, s3_key)
+    print(f"Checkpoint saved to s3://{S3_BUCKET}/{s3_key}", flush=True)
+
+def load_checkpoint_from_s3():
+    s3_key = S3_CHECKPOINT_PREFIX + 'checkpoint.pt'
+    local_path = TEMP_DIR / 'checkpoint.pt'
+    S3_CLIENT.download_file(S3_BUCKET, s3_key, str(local_path))
+    return torch.load(str(local_path), map_location=DEVICE)
+
+def delete_checkpoint_from_s3():
+    s3_key = S3_CHECKPOINT_PREFIX + 'checkpoint.pt'
+    S3_CLIENT.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+    print(f"Checkpoint deleted from s3://{S3_BUCKET}/{s3_key}")
+
+def upload_and_delete(local_path, filename):
+    s3_key = OUTPUT_S3_PREFIX + filename
+    S3_CLIENT.upload_file(str(local_path), S3_BUCKET, s3_key)
+    os.remove(str(local_path))
+    print(f"Uploaded to s3://{S3_BUCKET}/{s3_key}")
+
 if __name__ == "__main__":
-    from torch.utils.tensorboard import SummaryWriter
+    # -------------------------------------------------------------------------
+    # Parse CLI arguments passed by set_the_table_and_run.py
+    # -------------------------------------------------------------------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bucket',             required=True,  help='S3 bucket name')
+    parser.add_argument('--checkpoint_prefix',  required=True,  help='S3 prefix for checkpoint file (e.g. ryan/ml_work/ml_checkpoint/)')
+    parser.add_argument('--data_dir',           required=True,  help='Local path where training data was downloaded')
+    parser.add_argument('--output_data_prefix', required=True,  help='S3 prefix for final outputs (e.g. ryan/ml_work/ml_output/)')
+    args = parser.parse_args()
+
+    # Populate globals from args
+    global S3_CLIENT, S3_BUCKET, S3_CHECKPOINT_PREFIX, DATA_DIR, STATIC_DIR, OUTPUT_S3_PREFIX
+    S3_CLIENT            = boto3.client('s3')
+    S3_BUCKET            = args.bucket
+    S3_CHECKPOINT_PREFIX = args.checkpoint_prefix if args.checkpoint_prefix.endswith('/') else args.checkpoint_prefix + '/'
+    DATA_DIR             = Path(args.data_dir) / 'dynamic_days'
+    STATIC_DIR           = Path(args.data_dir) / 'static_topo'
+    base_output_s3       = args.output_data_prefix if args.output_data_prefix.endswith('/') else args.output_data_prefix + '/'
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.benchmark = True
-
-    # CHECK GPU IS BEING USED!
-    print(f"Using device: {DEVICE}")
-    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
-
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    if not os.path.exists(DATA_DIR):
+    print(f"Using device: {DEVICE}")
+
+    if not DATA_DIR.exists():
         raise RuntimeError(f"Data directory not found: {DATA_DIR}")
 
     all_day_folders = sorted([f.path for f in os.scandir(DATA_DIR) if f.is_dir()])
@@ -1210,27 +1248,38 @@ if __name__ == "__main__":
     print(f"Loaded {len(static_imgs)} static terrain images")
 
     train_dataset = GeoFolderDataset(train_folders, stats=global_stats, static_imgs=static_imgs, patch_size=PATCH_SIZE, augment=True,  samples_per_file=SAMPLES_PER_FILE)
-    val_dataset   = GeoFolderDataset(val_folders,   stats=global_stats, static_imgs=static_imgs, patch_size=PATCH_SIZE, augment=False, samples_per_file=150)
+    val_dataset   = GeoFolderDataset(val_folders,   stats=global_stats, static_imgs=static_imgs, patch_size=PATCH_SIZE, augment=False, samples_per_file=500)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=5, prefetch_factor=2, pin_memory=True, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=1, prefetch_factor=1, pin_memory=True, persistent_workers=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
     for positional_embedding in POSITIONAL_EMBEDDING_LIST:
         print(f'\n\nRunning model with {positional_embedding} positional embedding!\n')
 
-        # create output folder by current datetime to be unique
-        OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, positional_embedding, DATE_TIME)
+        # -------------------------------------------------------------------------
+        # Check for an existing checkpoint on S3 to resume from
+        # -------------------------------------------------------------------------
+        checkpoint = None
+        try:
+            response = S3_CLIENT.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_CHECKPOINT_PREFIX)
+            if 'Contents' in response and any(obj['Key'].endswith('checkpoint.pt') for obj in response['Contents']):
+                print("Found existing checkpoint on S3 — resuming training...")
+                checkpoint = load_checkpoint_from_s3()
+        except Exception as e:
+            print(f"No checkpoint found or error loading checkpoint: {e}. Starting fresh.")
 
-        if os.path.exists(OUTPUT_DIR):
-            raise RuntimeError('ERROR: folder {} already exists, please wait a minute to run this code again.')
+        # Use the datetime folder name stored in checkpoint if resuming, otherwise create a new one
+        if checkpoint is not None and 'output_s3_folder' in checkpoint:
+            run_date_time = checkpoint['output_s3_folder']
+            print(f"Resuming into existing S3 output folder: {run_date_time}")
         else:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            run_date_time = DATE_TIME
 
-        # TensorBoard writer
-        tb_log_dir = os.path.join(OUTPUT_DIR, 'tensorboard')
-        writer = SummaryWriter(log_dir=tb_log_dir)
+        OUTPUT_S3_PREFIX = base_output_s3 + positional_embedding + '/' + run_date_time + '/'
 
-        # ViT Model
+        # -------------------------------------------------------------------------
+        # Build model, optimizer, scheduler
+        # -------------------------------------------------------------------------
         model = MaskedAutoencoderViT(
             pos_emb_selected=positional_embedding,
             img_size=PATCH_SIZE,
@@ -1245,7 +1294,7 @@ if __name__ == "__main__":
             decoder_num_heads=NUM_HEADS,
             dropout=DROPOUT
         ).to(DEVICE)
-        model = torch.compile(model)
+        #model = torch.compile(model, mode="reduce-overhead")
 
         # Verify model shapes with a dummy forward pass
         dummy_input = torch.randn(2, IN_CHANS, PATCH_SIZE, PATCH_SIZE, device=DEVICE)
@@ -1258,209 +1307,252 @@ if __name__ == "__main__":
 
         optimizer = optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.01)
 
-        # Initialize Scaler
-        scaler = GradScaler('cuda')
-
         # Use warmup and decay scheduler to prevent gradient explosion
         scheduler_warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=WARMUP_EPOCHS)
         scheduler_decay = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS)
         scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_decay], milestones=[WARMUP_EPOCHS])
 
         train_losses = []
-        val_losses = []
+        val_losses   = []
+        best_val_loss = float('inf')
+        patience_counter = 0
+        start_epoch = 0
+        best_model_s3_key = None
 
-        # Print TensorBoard command before training starts
+        # Restore state from checkpoint if we have one
+        if checkpoint is not None:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            train_losses     = checkpoint['train_losses']
+            val_losses       = checkpoint['val_losses']
+            best_val_loss    = checkpoint['best_val_loss']
+            patience_counter = checkpoint['patience_counter']
+            start_epoch      = checkpoint['epoch'] + 1
+            best_model_s3_key = checkpoint.get('best_model_s3_key', None)
+            print(f"Resumed from epoch {start_epoch}")
+
         print("")
         print("=" * 80)
         print("  TRAINING IS STARTING")
-        print(f"  Train: {len(train_dataset)} samples: {len(train_loader)} batches/epoch")
-        print(f"  Val:   {len(val_dataset)} samples: {len(val_loader)} batches/epoch")
-        print("")
-        print("  To monitor training in real time, open a new terminal and run:")
-        print(f"  tensorboard --logdir=\"{tb_log_dir}\"")
-        print("")
-        print("  Then open http://localhost:6006 in your browser")
+        print(f"  Train: {len(train_dataset)} samples and {len(train_loader)} batches/epoch")
+        print(f"  Val:   {len(val_dataset)} samples and {len(val_loader)} batches/epoch")
+        print(f"  Output S3 prefix: s3://{S3_BUCKET}/{OUTPUT_S3_PREFIX}")
         print("=" * 80)
         print("", flush=True)
 
-        # Write each epoch loss score to a text file
-        with open(os.path.join(OUTPUT_DIR, f'epoch_loss_output_{positional_embedding}_{DATE_TIME}.txt'), 'w') as epoch_output_file:
-            write_hyperparameters_to_file(epoch_output_file, positional_embedding)
-            best_val_loss = float('inf')
-            patience_counter = 0
+        relu_norm_threshold = torch.tensor(
+            global_stats['mean'][0] / global_stats['std'][0],
+            device=DEVICE, dtype=torch.bfloat16
+        )
+        relu_norm_scale = float(global_stats['std'][0] ** 2)
 
-            for epoch in range(EPOCHS):
-                epoch_start = time()
-                model.train()
-                total_train_loss = 0
-                total_train_grad_loss = 0
+        # Accumulate epoch loss log in memory; write + upload at end of run
+        import io
+        epoch_log_buffer = io.StringIO()
+        write_hyperparameters_to_file(epoch_log_buffer, positional_embedding)
 
-                num_batches = len(train_loader)
-                # Process batches
-                for batch_idx, (batch_data, batch_valid_mask) in enumerate(train_loader):
+        for epoch in range(start_epoch, EPOCHS):
+            epoch_start = time()
+            model.train()
+            total_train_loss = 0
+            total_train_grad_loss = 0
+            valid_train_batches = 0
+
+            num_batches = len(train_loader)
+            # Process batches
+            for batch_idx, (batch_data, batch_valid_mask) in enumerate(train_loader):
+                batch_data = batch_data.to(DEVICE)
+                batch_valid_mask = batch_valid_mask.to(DEVICE)
+                batch_data = batch_data + torch.randn_like(batch_data) * 0.02
+
+                target = batch_data[:, 0:1, :, :]
+
+                # Generate fake cloud masks
+                mask = generate_multiscale_mask(batch_data.size(0), size=PATCH_SIZE, target_ratio=MASK_RATIO)
+                masked_data = batch_data.clone()
+                masked_data[:, 0, :, :] = masked_data[:, 0, :, :] * mask[:, 0, :, :]
+                model_input = torch.cat([masked_data, mask, batch_valid_mask], dim=1)
+                cloud_eval_mask = batch_valid_mask * (1.0 - mask)
+
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    pred = model(model_input)
+                    mse_loss = masked_mse_loss(pred, target, cloud_eval_mask)
+                    grad_loss = gradient_loss(pred, target, cloud_eval_mask)
+                    relu_penalty = (cloud_eval_mask * F.relu(-pred - relu_norm_threshold) ** 2).sum() / (cloud_eval_mask.sum() + 1e-6)
+                    loss = mse_loss + (GRADIENT_LOSS_WEIGHT * grad_loss) + (RELU_PENALTY_WEIGHT * relu_norm_scale * relu_penalty)
+
+                if torch.isnan(loss):
+                    print(f"nan loss encountered at batch {batch_idx}")
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_train_loss += loss.item()
+                total_train_grad_loss += grad_loss.item()
+                valid_train_batches += 1
+
+                if batch_idx % 25 == 0:
+                    elapsed = time() - epoch_start
+                    print(f"  Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f} | {elapsed:.0f}s", flush=True)
+
+            scheduler.step()
+            avg_train_loss = total_train_loss / max(1, valid_train_batches)
+            avg_train_grad_loss = total_train_grad_loss / max(1, valid_train_batches)
+            train_losses.append(avg_train_loss)
+
+            # Run over validation data
+            model.eval()
+            total_val_loss = 0
+            total_val_grad_loss = 0
+            valid_val_batches = 0
+            with torch.no_grad():
+                for batch_data, batch_valid_mask in val_loader:
                     batch_data = batch_data.to(DEVICE)
                     batch_valid_mask = batch_valid_mask.to(DEVICE)
 
-                    # Target snow depth channel 0 [B, 1, H, W]
                     target = batch_data[:, 0:1, :, :]
 
-                    # Generate fake cloud masks
                     mask = generate_multiscale_mask(batch_data.size(0), size=PATCH_SIZE, target_ratio=MASK_RATIO)
                     masked_data = batch_data.clone()
                     masked_data[:, 0, :, :] = masked_data[:, 0, :, :] * mask[:, 0, :, :]
                     model_input = torch.cat([masked_data, mask, batch_valid_mask], dim=1)
                     cloud_eval_mask = batch_valid_mask * (1.0 - mask)
 
-                    optimizer.zero_grad(set_to_none=True)
-                    with autocast(device_type='cuda', dtype=torch.float16):
-                        pred = model(model_input)
+                    pred = model(model_input)
+                    mse_loss = masked_mse_loss(pred, target, cloud_eval_mask)
+                    grad_loss = gradient_loss(pred, target, cloud_eval_mask)
+                    relu_penalty = (cloud_eval_mask * F.relu(-pred - relu_norm_threshold) ** 2).sum() / (cloud_eval_mask.sum() + 1e-6)
+                    val_loss = mse_loss + GRADIENT_LOSS_WEIGHT * grad_loss + RELU_PENALTY_WEIGHT * relu_norm_scale * relu_penalty
 
-                        res_mean_t = torch.tensor(global_stats['mean'][0], device=DEVICE)
-                        res_std_t = torch.tensor(global_stats['std'][0], device=DEVICE)
-                        pred_meters = (pred * res_std_t) + res_mean_t
+                    if not torch.isnan(val_loss):
+                        total_val_loss += val_loss.item()
+                        total_val_grad_loss += grad_loss.item()
+                        valid_val_batches += 1
 
-                        mse_loss = masked_mse_loss(pred, target, cloud_eval_mask)
-                        grad_loss = gradient_loss(pred, target, cloud_eval_mask)
-                        relu_penalty = (cloud_eval_mask * F.relu(-pred_meters) ** 2).sum() / (cloud_eval_mask.sum() + 1e-6)
-                        loss = mse_loss + (GRADIENT_LOSS_WEIGHT * grad_loss) + (RELU_PENALTY_WEIGHT * relu_penalty)
+            avg_val_loss = total_val_loss / max(1, valid_val_batches)
+            avg_val_grad_loss = total_val_grad_loss / max(1, valid_val_batches)
+            val_losses.append(avg_val_loss)
 
-                    if torch.isnan(loss):
-                        print(f"nan loss encountered at batch {batch_idx}")
-                        continue
+            current_lr = scheduler.get_last_lr()[0]
 
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+            # TensorBoard logging (disabled for EC2 runs)
+            # writer.add_scalar('Loss/train_total', avg_train_loss, epoch)
+            # writer.add_scalar('Loss/val_total', avg_val_loss, epoch)
+            # writer.add_scalar('Loss/train_gradient', avg_train_grad_loss, epoch)
+            # writer.add_scalar('Loss/val_gradient', avg_val_grad_loss, epoch)
+            # writer.add_scalar('Hyperparameters/learning_rate', current_lr, epoch)
 
-                    total_train_loss += loss.detach()
-                    total_train_grad_loss += grad_loss.detach()
+            epoch_end = time()
+            epoch_output = f"Epoch [{epoch + 1}/{EPOCHS}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr:.2e} | Runtime: {epoch_end - epoch_start:.1f}s\n"
+            epoch_log_buffer.write(epoch_output)
+            print(epoch_output, end='')
 
-                    if batch_idx % 25 == 0:
-                        elapsed = time() - epoch_start
-                        print(f"  Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f} | {elapsed:.0f}s", flush=True)
-
-                scheduler.step()
-                avg_train_loss = total_train_loss / max(1, len(train_loader))
-                avg_train_grad_loss = total_train_grad_loss / max(1, len(train_loader))
-                train_losses.append(avg_train_loss)
-
-                # Run over validation data
-                model.eval()
-                total_val_loss = 0
-                total_val_grad_loss = 0
-                with torch.no_grad():
-                    for batch_data, batch_valid_mask in val_loader:
-                        batch_data = batch_data.to(DEVICE)
-                        batch_valid_mask = batch_valid_mask.to(DEVICE)
-
-                        target = batch_data[:, 0:1, :, :]
-
-                        mask = generate_multiscale_mask(batch_data.size(0), size=PATCH_SIZE, target_ratio=MASK_RATIO)
-                        masked_data = batch_data.clone()
-                        masked_data[:, 0, :, :] = masked_data[:, 0, :, :] * mask[:, 0, :, :]
-                        model_input = torch.cat([masked_data, mask, batch_valid_mask], dim=1)
-                        cloud_eval_mask = batch_valid_mask * (1.0 - mask)
-
-                        pred = model(model_input)
-                        res_mean_t = torch.tensor(global_stats['mean'][0], device=DEVICE)
-                        res_std_t = torch.tensor(global_stats['std'][0], device=DEVICE)
-                        pred_meters = (pred * res_std_t) + res_mean_t
-                        mse_loss = masked_mse_loss(pred, target, cloud_eval_mask)
-                        grad_loss = gradient_loss(pred, target, cloud_eval_mask)
-                        relu_penalty = (cloud_eval_mask * F.relu(-pred_meters) ** 2).sum() / (cloud_eval_mask.sum() + 1e-6)
-                        val_loss = mse_loss + GRADIENT_LOSS_WEIGHT * grad_loss + RELU_PENALTY_WEIGHT * relu_penalty
-
-                        if not torch.isnan(val_loss):
-                            total_val_loss += val_loss.item()
-                            total_val_grad_loss += grad_loss.item()
-
-                avg_val_loss = total_val_loss / max(1, len(val_loader))
-                avg_val_grad_loss = total_val_grad_loss / max(1, len(val_loader))
-                val_losses.append(avg_val_loss)
-
-                current_lr = scheduler.get_last_lr()[0]
-
-                # TensorBoard logging
-                writer.add_scalar('Loss/train_total', avg_train_loss, epoch)
-                writer.add_scalar('Loss/val_total', avg_val_loss, epoch)
-                writer.add_scalar('Loss/train_gradient', avg_train_grad_loss, epoch)
-                writer.add_scalar('Loss/val_gradient', avg_val_grad_loss, epoch)
-                writer.add_scalar('Hyperparameters/learning_rate', current_lr, epoch)
-
-                epoch_end = time()
-                epoch_output = f"Epoch [{epoch + 1}/{EPOCHS}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr:.2e} | Runtime: {epoch_end - epoch_start:.1f}s\n"
-                epoch_output_file.write(epoch_output)
-                print(epoch_output, end='')
-
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    patience_counter = 0
-                    model_save_path = os.path.join(OUTPUT_DIR, f'best_snow_model_{positional_embedding}_epoch_{epoch + 1}_{DATE_TIME}.pth')
-                    torch.save(model.state_dict(), model_save_path)
-                else:
-                    patience_counter += 1
-                    if patience_counter >= EARLY_STOP_PATIENCE:
-                        print(f"Early stopping at epoch {epoch + 1} (no improvement for {EARLY_STOP_PATIENCE} epochs)")
-                        break
-
-                # Output sample plots every 10 epochs
-                if (epoch + 1) % 10 == 0:
-                    visualize_test_samples(val_loader, model, epoch+1, positional_embedding)
-                    # Log sample prediction images to TensorBoard
-                    sample_img_path = os.path.join(OUTPUT_DIR, f'prediction_samples_epoch_{epoch+1}_{positional_embedding}_{DATE_TIME}.png')
-                    if os.path.exists(sample_img_path):
-                        from PIL import Image
-                        img = np.array(Image.open(sample_img_path))
-                        writer.add_image('Predictions/samples', img, epoch, dataformats='HWC')
-
-            save_loss_plot(train_losses, val_losses, positional_embedding)
-
-            print("\nTraining Finished. Loading best model for final evaluation...")
-            model.load_state_dict(torch.load(model_save_path, map_location=DEVICE))
-            model.eval()
-
-            print("Calculating RMSE and MAE...")
-            rmse, mae = calculate_metrics_in_meters(val_loader, model, global_stats)
-
-            final_val_results = f"\nFinal Validation Results: RMSE: {rmse:.4f} m, MAE: {mae:.4f} m"
-            epoch_output_file.write(final_val_results)
-            print(final_val_results)
-
-            # Log final metrics to TensorBoard
-            writer.add_scalar('Metrics/RMSE_meters', rmse, EPOCHS)
-            writer.add_scalar('Metrics/MAE_meters', mae, EPOCHS)
-
-            # Channel ablation test
-            print("\nRunning channel ablation test...")
-            channel_ablation_study(val_loader, model, global_stats)
-
-            # Run on all validation folders
-            if len(test_folders) > 0:
-                for test_folder in test_folders:
-                    ground_truth_date = os.path.basename(test_folder)
-                    for blind in [True, False]:
-                        path_list = predict_basin(test_folder, ground_truth_date, model, global_stats, blind=blind)
-                        if path_list is None:
-                            print(f"WARNING: predict_basin returned None for {ground_truth_date}, skipping")
-                            continue
-                        residual_prediction_file_path = path_list[0]
-                        residual_ground_truth_file_path = path_list[1]
-                        retrieved_input_mask = path_list[2]
-                        run_label = "blind" if blind else "partial"
-                        residual_prediction_file_fixed_crs_path = os.path.join(OUTPUT_DIR, f"model_prediction_for_test_date_{ground_truth_date}_{positional_embedding}_{DATE_TIME}_{run_label}_fixed.tif")
-                        force_metadata_match(residual_prediction_file_path, residual_ground_truth_file_path, residual_prediction_file_fixed_crs_path)
-                        make_output_plots(positional_embedding, DATE_TIME, ground_truth_date, residual_ground_truth_file_path, residual_prediction_file_fixed_crs_path, input_mask=retrieved_input_mask)
-                        os.remove(residual_prediction_file_path)
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                # Save best model weights to S3
+                best_model_filename = f'best_snow_model_{positional_embedding}_epoch_{epoch + 1}_{run_date_time}.pth'
+                local_best = TEMP_DIR / best_model_filename
+                torch.save(model.state_dict(), str(local_best))
+                best_model_s3_key = OUTPUT_S3_PREFIX + best_model_filename
+                S3_CLIENT.upload_file(str(local_best), S3_BUCKET, best_model_s3_key)
+                os.remove(str(local_best))
+                print(f"Best model uploaded to s3://{S3_BUCKET}/{best_model_s3_key}")
             else:
-                raise RuntimeError(f'AHHH! No validation files were assigned! AHHH! How did you even get this far?')
+                patience_counter += 1
+                if patience_counter >= EARLY_STOP_PATIENCE:
+                    print(f"Early stopping at epoch {epoch + 1} (no improvement for {EARLY_STOP_PATIENCE} epochs)")
+                    break
 
-            print(f"SUCCESS: Model weights saved to {model_save_path}")
+            # Output sample plots every 10 epochs and upload to S3
+            if (epoch + 1) % 10 == 0:
+                visualize_test_samples(val_loader, model, epoch+1, positional_embedding)
+                torch.cuda.empty_cache()
 
-            # SAVE THE STATS
-            stats_save_path = os.path.join(OUTPUT_DIR, f'dataset_stats_{positional_embedding}_{DATE_TIME}.npy')
-            np.save(stats_save_path, global_stats)
-            print(f"SUCCESS: Dataset statistics saved to {stats_save_path}")
+            # Save checkpoint to S3 after every epoch (overwrites previous)
+            save_checkpoint_to_s3({
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_losses':         train_losses,
+                'val_losses':           val_losses,
+                'best_val_loss':        best_val_loss,
+                'patience_counter':     patience_counter,
+                'best_model_s3_key':    best_model_s3_key,
+                'output_s3_folder':     run_date_time,
+            })
 
-        writer.close()
+        # -------------------------------------------------------------------------
+        # Training done — run final evaluation and upload all outputs to S3
+        # -------------------------------------------------------------------------
+        save_loss_plot(train_losses, val_losses, positional_embedding)
+
+        print("\nTraining Finished. Loading best model for final evaluation...")
+        if best_model_s3_key is None:
+            raise RuntimeError("No model checkpoint was saved during training — validation loss never improved.")
+
+        local_best = TEMP_DIR / 'best_model_eval.pth'
+        S3_CLIENT.download_file(S3_BUCKET, best_model_s3_key, str(local_best))
+        model.load_state_dict(torch.load(str(local_best), map_location=DEVICE))
+        os.remove(str(local_best))
+        model.eval()
+
+        print("Calculating RMSE and MAE...")
+        rmse, mae = calculate_metrics_in_meters(val_loader, model, global_stats)
+
+        final_val_results = f"\nFinal Validation Results: RMSE: {rmse:.4f} m, MAE: {mae:.4f} m"
+        epoch_log_buffer.write(final_val_results)
+        print(final_val_results)
+
+        # TensorBoard final metrics (disabled)
+        # writer.add_scalar('Metrics/RMSE_meters', rmse, EPOCHS)
+        # writer.add_scalar('Metrics/MAE_meters', mae, EPOCHS)
+
+        # Channel ablation test
+        print("\nRunning channel ablation test...")
+        channel_ablation_study(val_loader, model, global_stats)
+
+        # Run on all validation folders
+        if len(test_folders) > 0:
+            for test_folder in test_folders:
+                ground_truth_date = os.path.basename(test_folder)
+                for blind in [True, False]:
+                    path_list = predict_basin(test_folder, ground_truth_date, model, global_stats, blind=blind)
+                    if path_list is None:
+                        print(f"WARNING: predict_basin returned None for {ground_truth_date}, skipping")
+                        continue
+                    residual_prediction_file_path = path_list[0]
+                    residual_ground_truth_file_path = path_list[1]
+                    retrieved_input_mask = path_list[2]
+                    run_label = "blind" if blind else "partial"
+                    fixed_fn = f"model_prediction_for_test_date_{ground_truth_date}_{positional_embedding}_{run_date_time}_{run_label}_fixed.tif"
+                    fixed_local = TEMP_DIR / fixed_fn
+                    force_metadata_match(residual_prediction_file_path, residual_ground_truth_file_path, str(fixed_local))
+                    make_output_plots(positional_embedding, run_date_time, ground_truth_date, residual_ground_truth_file_path, str(fixed_local), input_mask=retrieved_input_mask)
+                    upload_and_delete(fixed_local, fixed_fn)
+                    os.remove(residual_prediction_file_path)
+        else:
+            raise RuntimeError(f'AHHH! No validation files were assigned! AHHH! How did you even get this far?')
+
+        # Upload epoch loss log
+        loss_log_filename = f'epoch_loss_output_{positional_embedding}_{run_date_time}.txt'
+        loss_log_local = TEMP_DIR / loss_log_filename
+        with open(str(loss_log_local), 'w') as f:
+            f.write(epoch_log_buffer.getvalue())
+        upload_and_delete(loss_log_local, loss_log_filename)
+
+        # Upload dataset stats
+        stats_filename = f'dataset_stats_{positional_embedding}_{run_date_time}.npy'
+        stats_local = TEMP_DIR / stats_filename
+        np.save(str(stats_local), global_stats)
+        upload_and_delete(stats_local, stats_filename)
+
+        print(f"SUCCESS: All outputs uploaded to s3://{S3_BUCKET}/{OUTPUT_S3_PREFIX}")
+
+        # Delete the checkpoint from S3 now that the run completed successfully
+        delete_checkpoint_from_s3()
